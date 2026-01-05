@@ -12,6 +12,7 @@
         "---Tasks---",
         "task-format",
         "task-difference",
+        "task-tutorial",
         "---Datasets---",
         "running-tbench",
         "datasets",
@@ -24,6 +25,7 @@
         "rl",
         "sft",
         "---Contributing---",
-        "contributing"
+        "contributing",
+        "roadmap"
     ]
 }
