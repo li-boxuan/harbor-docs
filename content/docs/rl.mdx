@@ -5,9 +5,14 @@ description: Reinforcement learning on Harbor tasks
 
 Performing RL on containerized agentic tasks is a common use case but difficult to implement and scale. Harbor provides a simple interface for training on containerized agentic environments.
 
-We plan to integrate with most popular RL frameworks. For now, we have worked with the SkyRL team to implement their interface for RL on Harbor tasks. 
+We plan to integrate with most popular RL frameworks. For now, we have worked with the SkyRL team to implement their interface for RL on Harbor tasks.
 
-In general, performing RL on Harbor tasks requires generating rollouts and recording tokens and rewards. This usually involves implementing an RL framework's rollout interface.
+## Overview
+
+Performing RL on Harbor tasks requires:
+1. **Generating rollouts**: Running agent trials on tasks to collect trajectories
+2. **Recording tokens and rewards**: Collecting prompt/completion token IDs, logprobs, and task rewards
+3. **Implementing a rollout interface**: Adapting Harbor's output to your RL framework's expected format
 
 We recommend using the `TrialConfig` or `JobConfig` classes to configure the rollouts. We also recommend using [cloud sandboxes](/docs/cloud) for scaling rollouts and reducing startup/teardown overhead.
 
@@ -26,23 +31,61 @@ task_configs = [
 ]
 ```
 
-## Example of a rollout interface
+## Enabling Rollout Collection
+
+To collect rollout details with Terminus-2, enable the `collect_rollout_details` flag:
+
+```python
+from harbor.models.trial.config import AgentConfig
+from harbor.models.agent_name import AgentName
+
+agent_config = AgentConfig(
+    name=AgentName.TERMINUS_2,
+    model_name="openai/gpt-5",
+    kwargs={
+        "collect_rollout_details": True,  # Enable token ID and logprob collection
+    }
+)
+```
+
+When enabled, Terminus-2 collects:
+- **Prompt Token IDs**: Full prompt tokens for each turn, including chat history
+- **Completion Token IDs**: Response tokens for each turn
+- **Logprobs**: Log probabilities for each completion token
+
+These are stored in `trial_result.agent_result.metadata["rollout_details"]` as a list of `RolloutDetail` objects.
+
+## Rollout Detail Structure
+
+Each `RolloutDetail` contains turn-by-turn token data:
+
+```python
+from typing import TypedDict
+
+class RolloutDetail(TypedDict, total=False):
+    prompt_token_ids: list[list[int]]      # Each turn's full prompt tokens
+    completion_token_ids: list[list[int]]  # Each turn's completion tokens
+    logprobs: list[list[float]]            # Each turn's token logprobs
+```
+
+For agents with subagents (like Terminus-2's summarization), multiple `RolloutDetail` objects may be present. By convention, `rollout_details[0]` contains the main agent's conversation history.
+
+## Example Rollout Interface
 
 ```python title="rollout_interface.py"
 from pathlib import Path
 
-from pydantic import BaseModel
-
 from harbor.job import Job
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import JobConfig, OrchestratorConfig
-from harbor.models.trial.config import EnvironmentConfig, TaskConfig
+from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig
+from harbor.models.agent_name import AgentName
 
 from your_rl_framework import SomeRLFrameworkRolloutInterface, Rollout
 
 
 class HarborRolloutInterface(SomeRLFrameworkRolloutInterface):
-    async def run(self, task_ids: list[TaskId]) -> list[Rollout]:
+    async def run(self, task_configs: list[TaskConfig]) -> list[Rollout]:
         job = Job(
             config=JobConfig(
                 jobs_dir=Path("jobs"),
@@ -55,9 +98,10 @@ class HarborRolloutInterface(SomeRLFrameworkRolloutInterface):
                         model_name="hosted_vllm/<model-name>",
                         kwargs={
                             "base_url": "https://<vllm-server-url>",
+                            "collect_rollout_details": True,  # Enable rollout collection
                         }
                     )
-                ]
+                ],
                 orchestrator=OrchestratorConfig(
                     n_concurrent_trials=32,
                 ),
@@ -69,29 +113,37 @@ class HarborRolloutInterface(SomeRLFrameworkRolloutInterface):
 
         rollouts = []
         for trial_result in result.trial_results:
+            # Extract reward
             reward = (
                 trial_result.verifier_result.rewards.get("reward", 0)
                 if trial_result.verifier_result and trial_result.verifier_result.rewards
                 else 0
             )
 
+            # Extract rollout details
             if (
                 trial_result.agent_result
                 and trial_result.agent_result.metadata
-                and "token_ids" in trial_result.agent_result.metadata
-                and "mask_ids" in trial_result.agent_result.metadata
+                and "rollout_details" in trial_result.agent_result.metadata
             ):
-                token_ids = trial_result.agent_result.metadata["token_ids"]
-                mask_ids = trial_result.agent_result.metadata["mask_ids"]
+                # Get main agent conversation (first RolloutDetail)
+                rollout_detail = trial_result.agent_result.metadata["rollout_details"][0]
+
+                prompt_token_ids = rollout_detail["prompt_token_ids"]
+                completion_token_ids = rollout_detail["completion_token_ids"]
+                logprobs = rollout_detail["logprobs"]
             else:
                 raise ValueError(
-                    f"Missing token_ids or mask_ids for trial {trial_result.trial_name}"
+                    f"Missing rollout_details for trial {trial_result.trial_name}. "
+                    "Ensure collect_rollout_details=True in agent config."
                 )
 
+            # Adapt to your RL framework's format
             rollout = Rollout(
                 reward=reward,
-                token_ids=token_ids,
-                mask_ids=mask_ids,
+                prompt_token_ids=prompt_token_ids,
+                completion_token_ids=completion_token_ids,
+                logprobs=logprobs,
             )
 
             rollouts.append(rollout)
@@ -100,11 +152,88 @@ class HarborRolloutInterface(SomeRLFrameworkRolloutInterface):
 
 ```
 
-## Collecting tokens from agents
+## Token Collection Strategies
 
-There are two strategies for collecting tokens:
+There are two main strategies for collecting tokens for RL training:
 
-1. Intercepting tokens from a vLLM server
-2. Returning tokens as part of the agent result metadata
+### 1. Agent Metadata (Recommended)
 
-(1) assumes you are using a vLLM server to generate tokens and have a framework that handles the interception. (2) assumes your agent is configured to return tokens as part of the agent result metadata. We are working to add flags to Terminus 2 to include this information. If you plan to train using a custom harness, be sure to include this information in the agent result metadata.
+Configure your agent to return tokens as part of the agent result metadata. For Terminus-2, set `collect_rollout_details=True` in the agent config kwargs:
+
+```python
+AgentConfig(
+    name=AgentName.TERMINUS_2,
+    model_name="your-model",
+    kwargs={
+        "collect_rollout_details": True,
+    }
+)
+```
+
+**Advantages**:
+- Simple to set up
+- No modification to inference server required
+- Works with any LLM provider that returns token IDs and logprobs
+
+**Disadvantages**:
+- Adds token data to trial result metadata, increasing storage size
+- Token data is collected after generation completes
+
+### 2. vLLM Server Interception
+
+Intercept tokens directly from a vLLM server during generation. This requires implementing custom logic to capture tokens as they're generated.
+
+**Advantages**:
+- Can stream tokens during generation
+- Doesn't require agent-level changes
+
+**Disadvantages**:
+- Requires modifying or wrapping the vLLM server
+- Only works with vLLM-based inference
+- More complex to implement
+
+For most use cases, **agent metadata collection (option 1) is recommended** as it's simpler and more portable across different LLM providers.
+
+## Custom Agent Implementation
+
+If you're implementing a custom agent for RL training, ensure you populate the `rollout_details` field in the agent result metadata:
+
+```python
+from harbor.models.agent.rollout_detail import RolloutDetail
+
+# In your agent's run method
+rollout_detail: RolloutDetail = {
+    "prompt_token_ids": [[101, 2054, ...], [...]],  # List of prompt token sequences
+    "completion_token_ids": [[2023, 2003, ...], [...]],  # List of completion token sequences
+    "logprobs": [[-0.1, -0.05, ...], [...]],  # List of logprob sequences
+}
+
+agent_result.metadata["rollout_details"] = [rollout_detail]
+```
+
+## Best Practices
+
+### Scaling RL Training
+
+- **Use cloud sandboxes**: Deploy trials to [cloud environments](/docs/cloud) like Daytona for parallel rollout generation
+- **Set concurrent trials**: Use `OrchestratorConfig(n_concurrent_trials=N)` to run multiple trials in parallel
+- **Batch tasks**: Group related tasks together to amortize environment startup costs
+
+### Data Management
+
+- **Filter successful rollouts**: Use verifier rewards to filter high-quality training data
+- **Export trajectories**: Use `harbor traces export` to save trajectories for offline training
+- **Monitor costs**: Track token usage and LLM API costs during rollout generation
+
+### Debugging
+
+- **Validate rollout data**: Check that `rollout_details` exists before accessing
+- **Inspect trajectories**: Review generated trajectories to understand agent behavior
+- **Test locally first**: Run small-scale experiments locally before scaling to cloud
+
+## Related Documentation
+
+- [Terminus-2](/docs/terminus-2) - Harbor's reference RL-ready agent
+- [Agent Trajectory Format](/docs/trajectory-format) - Trajectory storage format
+- [Cloud Sandboxes](/docs/cloud) - Scaling rollout generation
+- [Verifiers](/docs/verifiers) - Reward signal configuration
